@@ -1,0 +1,101 @@
+"""
+Configuración centralizada del bot.
+Todos los parámetros sensibles y ajustables viven en el archivo .env
+(ver .env.example para la plantilla).
+"""
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+def _get_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "y")
+
+
+def _get_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val is not None else default
+
+
+def _get_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val is not None else default
+
+
+class Config:
+    # --- Credenciales (SIEMPRE desde variables de entorno, nunca hardcodeadas) ---
+    API_KEY = os.getenv("BINANCE_API_KEY", "")
+    API_SECRET = os.getenv("BINANCE_API_SECRET", "")
+
+    # --- Entorno ---
+    # TESTNET debe permanecer True mientras pruebas. Pasar a False = dinero REAL.
+    TESTNET = _get_bool("TESTNET", True)
+
+    # --- Mercado ---
+    SYMBOL = os.getenv("SYMBOL", "BTCUSDT")
+    INTERVAL = os.getenv("INTERVAL", "1m")  # velas: 1m, 3m, 5m...
+    LEVERAGE = _get_int("LEVERAGE", 7)
+    MARGIN_TYPE = os.getenv("MARGIN_TYPE", "ISOLATED")  # ISOLATED o CROSSED
+
+    # --- Capital ---
+    CAPITAL_USDT = _get_float("CAPITAL_USDT", 200.0)
+    # % de margen máximo que se usa por posición (sobre CAPITAL_USDT)
+    MAX_MARGIN_PCT_PER_TRADE = _get_float("MAX_MARGIN_PCT_PER_TRADE", 25.0)
+
+    # --- Riesgo por operación (monto fijo en USDT, no % del capital) ---
+    # Cuánto se arriesga como máximo si se toca el SL. El tamaño de la
+    # posición se calcula para que la pérdida en el SL sea exactamente esto.
+    RISK_USDT_PER_TRADE = _get_float("RISK_USDT_PER_TRADE", 4.0)
+    # Relación ganancia/riesgo objetivo: el TP queda a (distancia del SL) * este
+    # número. Con RISK_USDT_PER_TRADE=4 y ratio=4, se buscan ~16 USDT de ganancia.
+    REWARD_RISK_RATIO = _get_float("REWARD_RISK_RATIO", 4.0)
+
+    # --- (Legado) Modo de riesgo por % de capital — ya no lo usa bot.py por
+    # defecto (ahora usa RISK_USDT_PER_TRADE + Bollinger), pero se conserva
+    # por si quieres volver a calc_position_size() en risk.py ---
+    RISK_PER_TRADE_PCT = _get_float("RISK_PER_TRADE_PCT", 1.0)
+    TAKE_PROFIT_PCT = _get_float("TAKE_PROFIT_PCT", 0.6)
+    STOP_LOSS_PCT = _get_float("STOP_LOSS_PCT", 0.3)
+
+    # --- Bandas de Bollinger (definen la distancia del SL; el TP se deriva
+    # de esa distancia * REWARD_RISK_RATIO) ---
+    BB_PERIOD = _get_int("BB_PERIOD", 20)
+    BB_STD = _get_float("BB_STD", 2.0)
+    # Límites de seguridad para el % de SL calculado desde la banda, para que
+    # nunca quede pegado al precio (posición gigante) ni demasiado lejos.
+    MIN_SL_PCT = _get_float("MIN_SL_PCT", 0.10)
+    MAX_SL_PCT = _get_float("MAX_SL_PCT", 0.60)
+
+    # --- Estocástico (entradas y salidas) ---
+    STOCH_K_PERIOD = _get_int("STOCH_K_PERIOD", 14)
+    STOCH_D_PERIOD = _get_int("STOCH_D_PERIOD", 3)
+    STOCH_SMOOTH_K = _get_int("STOCH_SMOOTH_K", 3)
+    STOCH_OVERSOLD = _get_float("STOCH_OVERSOLD", 20.0)
+    STOCH_OVERBOUGHT = _get_float("STOCH_OVERBOUGHT", 80.0)
+
+    # --- Alligator (Bill Williams) — define la tendencia ---
+    ALLIGATOR_JAW_PERIOD = _get_int("ALLIGATOR_JAW_PERIOD", 13)
+    ALLIGATOR_JAW_SHIFT = _get_int("ALLIGATOR_JAW_SHIFT", 8)
+    ALLIGATOR_TEETH_PERIOD = _get_int("ALLIGATOR_TEETH_PERIOD", 8)
+    ALLIGATOR_TEETH_SHIFT = _get_int("ALLIGATOR_TEETH_SHIFT", 5)
+    ALLIGATOR_LIPS_PERIOD = _get_int("ALLIGATOR_LIPS_PERIOD", 5)
+    ALLIGATOR_LIPS_SHIFT = _get_int("ALLIGATOR_LIPS_SHIFT", 3)
+    # % mínimo de separación entre lips y jaw para considerar que hay
+    # tendencia (evita operar con el "alligator dormido" en mercado lateral).
+    ALLIGATOR_MIN_SEPARATION_PCT = _get_float("ALLIGATOR_MIN_SEPARATION_PCT", 0.05)
+
+    # --- Límites operativos de seguridad ---
+    MAX_TRADES_PER_DAY = _get_int("MAX_TRADES_PER_DAY", 15)
+    MAX_CONSECUTIVE_LOSSES = _get_int("MAX_CONSECUTIVE_LOSSES", 3)
+    DAILY_MAX_LOSS_PCT = _get_float("DAILY_MAX_LOSS_PCT", 10.0)  # kill-switch diario
+    LOOP_SLEEP_SECONDS = _get_int("LOOP_SLEEP_SECONDS", 15)
+
+    # --- Logging ---
+    LOG_FILE = os.getenv("LOG_FILE", "trades_log.csv")
+
+
+config = Config()

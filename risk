@@ -1,0 +1,165 @@
+"""
+Cálculo de tamaño de posición, SL/TP y control de riesgo.
+
+Enfoque de riesgo fijo en dólares:
+- Se arriesga siempre RISK_USDT_PER_TRADE (ej. 3-5 USDT) por operación,
+  sin importar qué tan lejos quede el SL. El tamaño de la posición se ajusta
+  para que, si se toca el SL, la pérdida sea exactamente ese monto (no más).
+- El SL se ubica según la volatilidad reciente (distancia a la Banda de
+  Bollinger opuesta al precio de entrada), acotado entre MIN_SL_PCT y
+  MAX_SL_PCT para evitar posiciones absurdamente grandes (bandas muy
+  estrechas) o SL demasiado lejanos (bandas muy anchas).
+- El TP se calcula como esa misma distancia multiplicada por
+  REWARD_RISK_RATIO, así la ganancia potencial es siempre varias veces
+  mayor que el riesgo (ej. arriesgar 4 USDT buscando ~16 USDT).
+"""
+import math
+from config import config
+
+
+def round_quantity(quantity: float, step_size: float) -> float:
+    """Redondea la cantidad al step_size permitido por el símbolo en Binance."""
+    precision = int(round(-math.log10(step_size))) if step_size < 1 else 0
+    factor = 10 ** precision
+    return math.floor(quantity * factor) / factor
+
+
+def round_price(price: float, tick_size: float) -> float:
+    """
+    Redondea un precio al tick_size permitido por el símbolo en Binance.
+
+    IMPORTANTE: usar SIEMPRE esta función para stopPrice/price en órdenes,
+    en vez de round(x, 2) fijo. Binance exige que el precio sea múltiplo
+    exacto del tick_size del símbolo (que puede tener 1, 2, 4+ decimales
+    según el par); si no coincide, la orden se rechaza con error -1111.
+    """
+    precision = int(round(-math.log10(tick_size))) if tick_size < 1 else 0
+    return round(round(price / tick_size) * tick_size, precision)
+
+
+def calc_position_size(entry_price: float) -> dict:
+    """
+    (Se mantiene por compatibilidad; ya no la usa bot.py para abrir posiciones
+    -- ver calc_bollinger_sl_tp más abajo -- pero queda disponible si quieres
+    volver al modo % de capital.)
+    """
+    risk_usdt = config.CAPITAL_USDT * (config.RISK_PER_TRADE_PCT / 100.0)
+    sl_fraction = config.STOP_LOSS_PCT / 100.0
+    if sl_fraction <= 0:
+        raise ValueError("STOP_LOSS_PCT debe ser mayor a 0")
+
+    notional = risk_usdt / sl_fraction
+    max_margin = config.CAPITAL_USDT * (config.MAX_MARGIN_PCT_PER_TRADE / 100.0)
+    max_notional_by_margin = max_margin * config.LEVERAGE
+    notional = min(notional, max_notional_by_margin)
+
+    quantity = notional / entry_price
+    margin_used = notional / config.LEVERAGE
+
+    return {
+        "quantity": quantity,
+        "notional": notional,
+        "margin_used": margin_used,
+        "risk_usdt": risk_usdt,
+    }
+
+
+def calc_bollinger_sl_tp(df, entry_price: float, side: str, filters: dict) -> dict:
+    """
+    Calcula SL y TP usando las Bandas de Bollinger para la distancia del SL,
+    y un riesgo fijo en dólares (config.RISK_USDT_PER_TRADE) para el tamaño
+    de la posición. El TP queda a distancia = distancia_SL * REWARD_RISK_RATIO.
+
+    df: DataFrame con indicadores ya calculados (debe incluir bb_upper/bb_lower,
+        columnas producidas por strategy.build_indicators).
+    Devuelve: dict con sl_price, tp_price, quantity, notional, margin_used, risk_usdt, sl_pct.
+    """
+    last = df.iloc[-1]
+
+    if side == "LONG":
+        band_distance = entry_price - last["bb_lower"]
+    else:
+        band_distance = last["bb_upper"] - entry_price
+
+    if band_distance is None or band_distance != band_distance or band_distance <= 0:
+        # Banda no disponible o inconsistente (poco histórico, dato raro): usar el mínimo.
+        sl_fraction = config.MIN_SL_PCT / 100.0
+    else:
+        sl_fraction = band_distance / entry_price
+        # Acotar entre MIN_SL_PCT y MAX_SL_PCT para no arriesgar posiciones
+        # gigantes cuando la banda está casi pegada al precio, ni SL
+        # demasiado lejanos cuando la banda está muy ensanchada.
+        sl_fraction = max(config.MIN_SL_PCT / 100.0, min(sl_fraction, config.MAX_SL_PCT / 100.0))
+
+    tp_fraction = sl_fraction * config.REWARD_RISK_RATIO
+
+    risk_usdt = config.RISK_USDT_PER_TRADE
+    notional = risk_usdt / sl_fraction
+
+    # Tope duro: no usar más margen que MAX_MARGIN_PCT_PER_TRADE del capital.
+    max_margin = config.CAPITAL_USDT * (config.MAX_MARGIN_PCT_PER_TRADE / 100.0)
+    max_notional_by_margin = max_margin * config.LEVERAGE
+    notional = min(notional, max_notional_by_margin)
+
+    quantity = notional / entry_price
+    margin_used = notional / config.LEVERAGE
+
+    if side == "LONG":
+        sl_price = entry_price * (1 - sl_fraction)
+        tp_price = entry_price * (1 + tp_fraction)
+    else:
+        sl_price = entry_price * (1 + sl_fraction)
+        tp_price = entry_price * (1 - tp_fraction)
+
+    tick = filters["tick_size"]
+    sl_price = round_price(sl_price, tick)
+    tp_price = round_price(tp_price, tick)
+    quantity = round_quantity(quantity, filters["step_size"])
+
+    return {
+        "quantity": quantity,
+        "notional": notional,
+        "margin_used": margin_used,
+        "risk_usdt": risk_usdt,
+        "sl_price": sl_price,
+        "tp_price": tp_price,
+        "sl_pct": sl_fraction * 100.0,
+        "tp_pct": tp_fraction * 100.0,
+    }
+
+
+class DailyGuard:
+    """Kill-switch diario: detiene el bot si se superan los límites configurados."""
+
+    def __init__(self):
+        self.trades_today = 0
+        self.consecutive_losses = 0
+        self.pnl_today = 0.0
+        self.day = None
+
+    def _reset_if_new_day(self, today):
+        if self.day != today:
+            self.day = today
+            self.trades_today = 0
+            self.consecutive_losses = 0
+            self.pnl_today = 0.0
+
+    def register_trade(self, pnl: float, today):
+        self._reset_if_new_day(today)
+        self.trades_today += 1
+        self.pnl_today += pnl
+        if pnl < 0:
+            self.consecutive_losses += 1
+        else:
+            self.consecutive_losses = 0
+
+    def can_trade(self, today) -> tuple[bool, str]:
+        self._reset_if_new_day(today)
+        if self.trades_today >= config.MAX_TRADES_PER_DAY:
+            return False, f"Límite diario de operaciones alcanzado ({config.MAX_TRADES_PER_DAY})"
+        if self.consecutive_losses >= config.MAX_CONSECUTIVE_LOSSES:
+            return False, f"Límite de pérdidas consecutivas alcanzado ({config.MAX_CONSECUTIVE_LOSSES})"
+        max_loss = config.CAPITAL_USDT * (config.DAILY_MAX_LOSS_PCT / 100.0)
+        if self.pnl_today <= -max_loss:
+            return False, f"Kill-switch diario: pérdida máxima diaria alcanzada ({config.DAILY_MAX_LOSS_PCT}%)"
+        return True, ""

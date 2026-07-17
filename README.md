@@ -1,0 +1,2 @@
+# 77_binance_scalper_pro
+binance_scalper_pro_version_de_prueba

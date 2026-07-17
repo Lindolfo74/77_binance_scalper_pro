@@ -1,0 +1,190 @@
+"""
+Estrategia: Alligator + Estocástico + Bandas de Bollinger.
+
+Roles de cada indicador (tal como los usa el trader):
+- Alligator (Bill Williams): define la TENDENCIA (si conviene comprar o vender).
+  No opera nunca en contra de la tendencia que marca el Alligator.
+- Estocástico: marca las ENTRADAS (cruce %K/%D saliendo de sobrecompra/sobreventa,
+  a favor de la tendencia) y las SALIDAS anticipadas (cruce en contra).
+- Bandas de Bollinger: NO se usan para decidir si entrar, sino para calcular
+  el SL (distancia = volatilidad reciente vía el ancho de la banda). El TP se
+  deriva de esa misma distancia multiplicada por REWARD_RISK_RATIO, así la
+  ganancia potencial es siempre varias veces mayor que lo que se arriesga.
+  (El cálculo de precios de TP/SL vive en risk.py; aquí solo se calculan las
+  bandas como indicador.)
+
+Filosofía de salida anticipada:
+Si la posición está en ganancia y el Estocástico (o el Alligator) muestran
+que la tendencia se está revirtiendo, el bot cierra manualmente a mercado
+para asegurar la ganancia neta, en vez de esperar a que el precio retroceda
+hasta el TP original — o peor, hasta el SL.
+"""
+import pandas as pd
+import numpy as np
+
+
+# ---------------------------------------------------------------------------
+# Alligator (Bill Williams) — define la tendencia
+# ---------------------------------------------------------------------------
+
+def _smma(series: pd.Series, period: int) -> pd.Series:
+    """
+    Smoothed Moving Average: la media móvil que usa el Alligator
+    (distinta de una EMA o SMA normal).
+    """
+    smma = series.copy().astype(float)
+    if len(series) < period:
+        return smma * np.nan
+    smma.iloc[:period - 1] = np.nan
+    smma.iloc[period - 1] = series.iloc[:period].mean()
+    for i in range(period, len(series)):
+        smma.iloc[i] = (smma.iloc[i - 1] * (period - 1) + series.iloc[i]) / period
+    return smma
+
+
+def compute_alligator(df: pd.DataFrame, jaw_period=13, jaw_shift=8,
+                       teeth_period=8, teeth_shift=5,
+                       lips_period=5, lips_shift=3) -> pd.DataFrame:
+    df = df.copy()
+    median_price = (df["high"] + df["low"]) / 2
+    df["jaw"] = _smma(median_price, jaw_period).shift(jaw_shift)
+    df["teeth"] = _smma(median_price, teeth_period).shift(teeth_shift)
+    df["lips"] = _smma(median_price, lips_period).shift(lips_shift)
+    return df
+
+
+def get_trend(df: pd.DataFrame, min_separation_pct: float = 0.05) -> str | None:
+    """
+    Devuelve 'UP', 'DOWN' o None (sin tendencia clara / "alligator dormido").
+
+    UP:   lips > teeth > jaw  y el precio cierra por encima de las 3 líneas.
+    DOWN: lips < teeth < jaw  y el precio cierra por debajo de las 3 líneas.
+
+    min_separation_pct evita operar cuando las líneas están entrelazadas
+    (mercado lateral / "boca cerrada" del Alligator).
+    """
+    last = df.iloc[-1]
+    jaw, teeth, lips = last["jaw"], last["teeth"], last["lips"]
+    if pd.isna(jaw) or pd.isna(teeth) or pd.isna(lips):
+        return None
+
+    price = last["close"]
+    separation = abs(lips - jaw) / jaw * 100 if jaw else 0.0
+    if separation < min_separation_pct:
+        return None
+
+    if lips > teeth > jaw and price > lips:
+        return "UP"
+    if lips < teeth < jaw and price < lips:
+        return "DOWN"
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Estocástico — marca entradas y salidas
+# ---------------------------------------------------------------------------
+
+def compute_stochastic(df: pd.DataFrame, k_period=14, d_period=3, smooth_k=3) -> pd.DataFrame:
+    df = df.copy()
+    low_min = df["low"].rolling(window=k_period).min()
+    high_max = df["high"].rolling(window=k_period).max()
+    raw_k = 100 * (df["close"] - low_min) / (high_max - low_min).replace(0, np.nan)
+    df["stoch_k"] = raw_k.rolling(window=smooth_k).mean()
+    df["stoch_d"] = df["stoch_k"].rolling(window=d_period).mean()
+    return df
+
+
+def _stoch_cross_up(prev, last) -> bool:
+    return prev["stoch_k"] <= prev["stoch_d"] and last["stoch_k"] > last["stoch_d"]
+
+
+def _stoch_cross_down(prev, last) -> bool:
+    return prev["stoch_k"] >= prev["stoch_d"] and last["stoch_k"] < last["stoch_d"]
+
+
+# ---------------------------------------------------------------------------
+# Bandas de Bollinger — indicador base para el cálculo de SL/TP (ver risk.py)
+# ---------------------------------------------------------------------------
+
+def compute_bollinger(df: pd.DataFrame, period=20, num_std=2.0) -> pd.DataFrame:
+    df = df.copy()
+    mid = df["close"].rolling(window=period).mean()
+    std = df["close"].rolling(window=period).std()
+    df["bb_mid"] = mid
+    df["bb_upper"] = mid + num_std * std
+    df["bb_lower"] = mid - num_std * std
+    return df
+
+
+# ---------------------------------------------------------------------------
+# Construcción de indicadores y lectura de señales
+# ---------------------------------------------------------------------------
+
+def build_indicators(df: pd.DataFrame, config) -> pd.DataFrame:
+    df = compute_alligator(
+        df,
+        jaw_period=config.ALLIGATOR_JAW_PERIOD, jaw_shift=config.ALLIGATOR_JAW_SHIFT,
+        teeth_period=config.ALLIGATOR_TEETH_PERIOD, teeth_shift=config.ALLIGATOR_TEETH_SHIFT,
+        lips_period=config.ALLIGATOR_LIPS_PERIOD, lips_shift=config.ALLIGATOR_LIPS_SHIFT,
+    )
+    df = compute_stochastic(
+        df,
+        k_period=config.STOCH_K_PERIOD, d_period=config.STOCH_D_PERIOD,
+        smooth_k=config.STOCH_SMOOTH_K,
+    )
+    df = compute_bollinger(df, period=config.BB_PERIOD, num_std=config.BB_STD)
+    return df
+
+
+def get_entry_signal(df: pd.DataFrame, config) -> str | None:
+    """
+    LONG:  tendencia UP (Alligator) + Estocástico cruza hacia arriba viniendo
+           de zona de sobreventa.
+    SHORT: tendencia DOWN (Alligator) + Estocástico cruza hacia abajo viniendo
+           de zona de sobrecompra.
+    """
+    if len(df) < 2:
+        return None
+
+    trend = get_trend(df, config.ALLIGATOR_MIN_SEPARATION_PCT)
+    if trend is None:
+        return None
+
+    prev, last = df.iloc[-2], df.iloc[-1]
+    if pd.isna(last["stoch_k"]) or pd.isna(last["stoch_d"]) or pd.isna(prev["stoch_k"]):
+        return None
+
+    if trend == "UP" and _stoch_cross_up(prev, last) and prev["stoch_k"] < config.STOCH_OVERSOLD:
+        return "LONG"
+    if trend == "DOWN" and _stoch_cross_down(prev, last) and prev["stoch_k"] > config.STOCH_OVERBOUGHT:
+        return "SHORT"
+    return None
+
+
+def get_exit_signal(df: pd.DataFrame, side: str, config) -> bool:
+    """
+    True si conviene cerrar anticipadamente una posición abierta porque hay
+    señal de que la tendencia se está revirtiendo:
+    - El Estocástico cruza en contra viniendo de zona de sobrecompra/sobreventa, o
+    - El Alligator ya deja de confirmar la tendencia de la posición.
+
+    Esta función NO decide si hay ganancia o pérdida — eso lo evalúa bot.py
+    antes de actuar sobre esta señal (solo se usa para "salir con ganancia").
+    """
+    if len(df) < 2:
+        return False
+
+    prev, last = df.iloc[-2], df.iloc[-1]
+    if pd.isna(last["stoch_k"]) or pd.isna(last["stoch_d"]) or pd.isna(prev["stoch_k"]):
+        return False
+
+    trend = get_trend(df, config.ALLIGATOR_MIN_SEPARATION_PCT)
+
+    if side == "LONG":
+        stoch_reversal = _stoch_cross_down(prev, last) and prev["stoch_k"] > config.STOCH_OVERBOUGHT
+        trend_broken = trend == "DOWN"
+        return bool(stoch_reversal or trend_broken)
+    else:
+        stoch_reversal = _stoch_cross_up(prev, last) and prev["stoch_k"] < config.STOCH_OVERSOLD
+        trend_broken = trend == "UP"
+        return bool(stoch_reversal or trend_broken)
